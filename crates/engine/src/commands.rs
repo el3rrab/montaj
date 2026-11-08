@@ -97,6 +97,21 @@ pub fn register_extra(specs: fn() -> Vec<CommandSpec>) -> bool {
     EXTRA.set(specs).is_ok()
 }
 
+/// The embedding app's poll, run by [`Session::poll_persistence`] (once per UI frame), e.g. to
+/// apply the result of its own background job.
+static EXTRA_POLL: OnceLock<fn(&mut Session)> = OnceLock::new();
+
+/// Register the extra poll (see [`EXTRA_POLL`]). Returns `false` if one was already registered.
+pub fn register_poll(poll: fn(&mut Session)) -> bool {
+    EXTRA_POLL.set(poll).is_ok()
+}
+
+pub(crate) fn run_extra_poll(s: &mut Session) {
+    if let Some(poll) = EXTRA_POLL.get() {
+        poll(s);
+    }
+}
+
 pub fn command_specs() -> &'static [CommandSpec] {
     static SPECS: OnceLock<Vec<CommandSpec>> = OnceLock::new();
     SPECS.get_or_init(|| {

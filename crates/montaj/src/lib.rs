@@ -1,35 +1,43 @@
 //! Montaj inside FilmCraft.
 //!
-//! [`install`] (call it first thing in `main`) registers Montaj's commands with the engine:
+//! [`install`] (call it first thing in `main`) registers Montaj's commands and its per-frame
+//! poll with the engine:
 //!
-//! - `montaj.autocut.analyze`: mix the active sequence's audio, transcribe it (Gemini), find
-//!   retakes and asides (the text model), and return the suggested cuts — each with an id, its
-//!   time, kind, words and reason. The paid result is kept for the sequence, so applying,
-//!   re-planning or asking again costs nothing.
-//! - `montaj.autocut.apply`: ripple-delete the suggested cuts (all, or all but `skip`) in ONE
-//!   undo step, and log which suggestions were taken or refused (the start of learning the
-//!   editor's taste).
+//! - `montaj.autocut` — **Sequence ▸ Montaj AI ▸ Auto Cut (AI)**: one step. Runs in the
+//!   background as a job (progress bar, step and cancel button in the status bar): mixes the
+//!   active sequence's audio, transcribes it (Gemini), finds retakes and asides (the text
+//!   model), then — back on the main thread, when the job finishes — ripple-deletes every cut in
+//!   ONE undo step. With `{"wait": true}` (CLI, MCP) it runs to the end before returning.
+//! - `montaj.autocut.analyze`: the analysis only, returning the suggested cuts (CLI, MCP).
+//! - `montaj.autocut.apply` — **Auto Cut: Apply**: apply the last analysis (all, or all but
+//!   `skip`).
 //!
-//! Both appear in Sequence ▸ Montaj AI, the CLI and the MCP server like any FilmCraft command
-//! (FilmCraft's menu bar has a fixed set of top-level menus).
+//! Paid analyses are cached on disk by an audio fingerprint, so the same footage is never paid
+//! for twice. Every applied suggestion is logged (taken / refused) for learning the editor's
+//! taste.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use filmcraft_engine::commands::NamedKeys;
-use filmcraft_engine::{CommandSpec, EngineError, Result, Session};
-use filmcraft_project::ItemId;
+use filmcraft_engine::export::{Progress, Report};
+use filmcraft_engine::{CommandSpec, EngineError, Job, Result, Session};
+use filmcraft_project::{ItemId, Project, Sequence};
+use filmcraft_render::SourceProvider;
 use filmcraft_time::{Tick, TimeRange};
 use montaj_ai::autocut::Analysis;
 use montaj_ai::keys::Keys;
 use serde_json::{Value, json};
 
-/// Register Montaj's commands. Call before anything uses the command registry.
+/// Register Montaj's commands and poll. Call before anything uses the command registry.
 pub fn install() -> bool {
-    filmcraft_engine::commands::register_extra(specs)
+    let a = filmcraft_engine::commands::register_extra(specs);
+    let b = filmcraft_engine::commands::register_poll(poll);
+    a && b
 }
 
 /// The cloud transcriber to put in `Session::transcriber` (OpenAI or Gemini, by the keys set).
@@ -37,23 +45,25 @@ pub fn transcriber(data_dir: Option<&std::path::Path>) -> Option<Arc<dyn filmcra
     montaj_ai::transcribe::installed(data_dir)
 }
 
+const MENU: &[&str] = &["Sequence", "Montaj AI"];
+
 fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec {
-            id: "montaj.autocut.analyze",
-            label: "Auto Cut: Analyze (AI)",
-            menu: &["Sequence", "Montaj AI"],
+            id: "montaj.autocut",
+            label: "Auto Cut (AI)",
+            menu: MENU,
             shortcut: None,
-            params: r#"{"refresh":bool?}"#,
-            enabled: has_sequence,
-            run: analyze,
+            params: r#"{"wait":bool?,"refresh":bool?}"#,
+            enabled: can_start,
+            run: autocut,
             journal: false,
             named: NamedKeys::NONE,
         },
         CommandSpec {
             id: "montaj.autocut.apply",
-            label: "Auto Cut: Apply",
-            menu: &["Sequence", "Montaj AI"],
+            label: "Auto Cut: Apply Again",
+            menu: MENU,
             shortcut: None,
             params: r#"{"skip":[int]?}"#,
             enabled: has_analysis,
@@ -61,13 +71,41 @@ fn specs() -> Vec<CommandSpec> {
             journal: true,
             named: NamedKeys::NONE,
         },
+        CommandSpec {
+            id: "montaj.autocut.analyze",
+            label: "Auto Cut: Analyze",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"refresh":bool?}"#,
+            enabled: can_start,
+            run: analyze,
+            journal: false,
+            named: NamedKeys::NONE,
+        },
     ]
 }
 
-/// Paid analyses kept per sequence for this run of the app.
+// ------------------------------------------------------------------ state
+
+/// Analyses kept per sequence for this run of the app (for Apply Again).
 fn cache() -> &'static Mutex<HashMap<ItemId, Analysis>> {
     static C: std::sync::OnceLock<Mutex<HashMap<ItemId, Analysis>>> = std::sync::OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The background auto-cut, if one is running.
+struct Running {
+    job: u64,
+    sequence: ItemId,
+    revision: u64,
+    progress: Arc<Progress>,
+    result: Arc<Mutex<Option<std::result::Result<Analysis, String>>>>,
+    job_result: Arc<Mutex<Option<std::result::Result<Report, String>>>>,
+}
+
+fn running() -> &'static Mutex<Option<Running>> {
+    static R: std::sync::OnceLock<Mutex<Option<Running>>> = std::sync::OnceLock::new();
+    R.get_or_init(|| Mutex::new(None))
 }
 
 fn err(msg: impl std::fmt::Display) -> EngineError {
@@ -75,41 +113,61 @@ fn err(msg: impl std::fmt::Display) -> EngineError {
 }
 
 fn has_sequence(s: &Session) -> std::result::Result<(), String> {
-    if s.active_sequence().is_some() { Ok(()) } else { Err("open a sequence first".into()) }
+    match s.active_sequence() {
+        Some(q) if q.duration() > Tick::ZERO => Ok(()),
+        Some(_) => Err("the sequence is empty".into()),
+        None => Err("open a sequence first".into()),
+    }
+}
+
+fn can_start(s: &Session) -> std::result::Result<(), String> {
+    has_sequence(s)?;
+    if running().lock().map(|r| r.is_some()).unwrap_or(false) { Err("Auto Cut is already running".into()) } else { Ok(()) }
 }
 
 fn has_analysis(s: &Session) -> std::result::Result<(), String> {
     has_sequence(s)?;
     let id = s.state.active_sequence.ok_or("open a sequence first")?;
     let ok = cache().lock().map(|c| c.contains_key(&id)).unwrap_or(false);
-    if ok { Ok(()) } else { Err("run Auto Cut: Analyze first".into()) }
+    if ok { Ok(()) } else { Err("run Auto Cut (AI) first".into()) }
 }
 
-/// The active sequence's mix as 16 kHz mono, mixed in 10-second blocks.
-fn sequence_audio_16k(s: &Session) -> Result<Vec<f32>> {
-    let seq = s.active_sequence().ok_or_else(|| err("open a sequence first"))?;
+fn data_dir() -> Option<std::path::PathBuf> {
+    filmcraft_engine::autosave::default_data_dir()
+}
+
+/// A message in the app's status bar (and the Events panel for errors).
+fn toast(s: &mut Session, message: String, error: bool) {
+    s.events.push(filmcraft_engine::Event::Toast { message, error });
+}
+
+// ------------------------------------------------------------------ work (any thread)
+
+/// The sequence's mix as 16 kHz mono, mixed in 10-second blocks; `progress(fraction)` per block.
+fn mix_16k(project: &Project, seq: &Sequence, provider: &dyn SourceProvider, progress: &mut dyn FnMut(f32) -> bool) -> std::result::Result<Vec<f32>, String> {
     let rate = i64::from(seq.settings.sample_rate.max(1));
     let total = (seq.duration().seconds() * rate as f64).ceil() as i64;
     if total <= 0 {
-        return Err(err("the sequence is empty"));
+        return Err("the sequence is empty".into());
     }
-    let provider = s.media.provider(s.project.clone(), s.services.clone());
     let step = rate as f64 / 16_000.0;
     let mut out = Vec::with_capacity((total as f64 / step) as usize + 1);
     let block = 10 * rate;
     let mut start = 0i64;
     let mut next = 0.0f64; // next output sample position, in input samples
     while start < total {
+        if !progress(start as f32 / total as f32) {
+            return Err("stopped".into());
+        }
         let n = block.min(total - start) as usize;
-        let buf = filmcraft_render::audio::mix_sequence(&s.project, seq, start, n, &provider);
+        let buf = filmcraft_render::audio::mix_sequence(project, seq, start, n, provider);
         let chans = buf.channels.len().max(1) as f32;
         let mono: Vec<f32> = (0..n).map(|i| buf.channels.iter().map(|c| c.get(i).copied().unwrap_or(0.0)).sum::<f32>() / chans).collect();
         // box-average down to 16 kHz (a light low-pass for speech)
         while next < (start + n as i64) as f64 {
-            let a = (next - start as f64).max(0.0) as usize;
+            let a = ((next - start as f64).max(0.0) as usize).min(n - 1);
             let b = ((next + step - start as f64) as usize).clamp(a + 1, n);
-            let sum: f32 = mono[a.min(n - 1)..b].iter().sum();
-            out.push(sum / (b - a.min(n - 1)).max(1) as f32);
+            out.push(mono[a..b].iter().sum::<f32>() / (b - a) as f32);
             next += step;
         }
         start += n as i64;
@@ -130,8 +188,31 @@ fn fingerprint(audio: &[f32]) -> u64 {
     h ^ audio.len() as u64
 }
 
-fn data_dir() -> Option<std::path::PathBuf> {
-    filmcraft_engine::autosave::default_data_dir()
+/// The analysis of `audio`: from the disk cache when this audio was analysed before (free),
+/// else paid (Gemini + the text model) and cached.
+fn analysis_for(audio: &[f32], refresh: bool, progress: &mut dyn FnMut(f32, &str) -> bool) -> std::result::Result<Analysis, String> {
+    let disk = data_dir().map(|d| d.join("montaj").join("analysis").join(format!("{:016x}.json", fingerprint(audio))));
+    if !refresh && let Some(a) = disk.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str::<Analysis>(&t).ok()) {
+        return Ok(a);
+    }
+    let keys = Keys::load(data_dir().as_deref());
+    let a = montaj_ai::autocut::analyze(audio, &keys, progress).map_err(|e| e.to_string())?;
+    if let Some(p) = &disk
+        && let Some(dir) = p.parent()
+        && std::fs::create_dir_all(dir).is_ok()
+        && let Ok(t) = serde_json::to_string(&a)
+    {
+        let _ = std::fs::write(p, t);
+    }
+    Ok(a)
+}
+
+// ------------------------------------------------------------------ commands (main thread)
+
+fn summary(a: &Analysis) -> String {
+    let cut: f64 = a.cuts.iter().map(|c| c.end - c.start).sum();
+    let talk = a.cuts.iter().filter(|c| c.kind != "pause").count();
+    format!("{} cuts ({talk} retakes/asides/stutters, {} pauses), {:.0} s of {:.0} s", a.cuts.len(), a.cuts.len() - talk, cut, a.duration)
 }
 
 fn suggestions(a: &Analysis) -> Value {
@@ -145,61 +226,8 @@ fn suggestions(a: &Analysis) -> Value {
     })
 }
 
-fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = s.state.active_sequence.ok_or_else(|| err("open a sequence first"))?;
-    let refresh = p.get("refresh").and_then(Value::as_bool).unwrap_or(false);
-    if !refresh && let Some(a) = cache().lock().ok().and_then(|c| c.get(&id).cloned()) {
-        return Ok(suggestions(&a));
-    }
-    let audio = sequence_audio_16k(s)?;
-    // the same audio was analysed before (any project, any run): reuse it, no paid call
-    let disk = data_dir().map(|d| d.join("montaj").join("analysis").join(format!("{:016x}.json", fingerprint(&audio))));
-    let cached: Option<Analysis> = if refresh { None } else { disk.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str(&t).ok()) };
-    let a = match cached {
-        Some(a) => a,
-        None => {
-            let keys = Keys::load(data_dir().as_deref());
-            let a = match montaj_ai::autocut::analyze(&audio, &keys, &mut |_| true) {
-                Ok(a) => a,
-                Err(e) => {
-                    toast(s, format!("Montaj Auto Cut failed: {e}"), true);
-                    return Err(err(e));
-                }
-            };
-            if let Some(p) = &disk
-                && let Some(dir) = p.parent()
-                && std::fs::create_dir_all(dir).is_ok()
-                && let Ok(t) = serde_json::to_string(&a)
-            {
-                let _ = std::fs::write(p, t);
-            }
-            a
-        }
-    };
-    let out = suggestions(&a);
-    let cut: f64 = a.cuts.iter().map(|c| c.end - c.start).sum();
-    let retakes = a.cuts.iter().filter(|c| c.kind != "pause").count();
-    toast(
-        s,
-        format!(
-            "Montaj Auto Cut: {} cuts suggested ({retakes} retakes/asides, {} pauses), {:.0} s of {:.0} s. Next: Sequence ▸ Montaj AI ▸ Auto Cut: Apply",
-            a.cuts.len(),
-            a.cuts.len() - retakes,
-            cut,
-            a.duration
-        ),
-        false,
-    );
-    if let Ok(mut c) = cache().lock() {
-        c.insert(id, a);
-    }
-    Ok(out)
-}
-
-fn apply(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = s.state.active_sequence.ok_or_else(|| err("open a sequence first"))?;
-    let a = cache().lock().ok().and_then(|c| c.get(&id).cloned()).ok_or_else(|| err("run Auto Cut: Analyze first"))?;
-    let skip: Vec<usize> = p.get("skip").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_u64).map(|n| n as usize).collect()).unwrap_or_default();
+/// Ripple-delete the cuts of `a` (but `skip`) from the active sequence in one undo step.
+fn apply_analysis(s: &mut Session, a: &Analysis, skip: &[usize]) -> Result<(usize, f64)> {
     let ranges: Vec<TimeRange> = a
         .cuts
         .iter()
@@ -209,13 +237,158 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let n = ranges.len();
     let removed = s.edit_sequence("Auto Cut", |q, ctx, _| Ok(filmcraft_edit::transcript::ripple_delete_ranges(q, ranges, ctx)))?;
-    log_decisions(&a, &skip);
-    // the analysis no longer matches the edited sequence
+    log_decisions(a, skip);
+    Ok((n, removed.seconds()))
+}
+
+/// Synchronous analysis of the active sequence (CLI, MCP, `wait`).
+fn analyze_now(s: &mut Session, refresh: bool) -> Result<Analysis> {
+    let id = s.state.active_sequence.ok_or_else(|| err("open a sequence first"))?;
+    let seq = s.active_sequence().cloned().ok_or_else(|| err("open a sequence first"))?;
+    let provider = s.media.provider(s.project.clone(), s.services.clone());
+    let audio = mix_16k(&s.project, &seq, &provider, &mut |_| true).map_err(err)?;
+    let a = match analysis_for(&audio, refresh, &mut |_, _| true) {
+        Ok(a) => a,
+        Err(e) => {
+            toast(s, format!("Montaj Auto Cut failed: {e}"), true);
+            return Err(err(e));
+        }
+    };
+    if let Ok(mut c) = cache().lock() {
+        c.insert(id, a.clone());
+    }
+    Ok(a)
+}
+
+fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
+    let a = analyze_now(s, p.get("refresh").and_then(Value::as_bool).unwrap_or(false))?;
+    toast(s, format!("Montaj Auto Cut: {} suggested", summary(&a)), false);
+    Ok(suggestions(&a))
+}
+
+fn autocut(s: &mut Session, p: &Value) -> Result<Value> {
+    let refresh = p.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+    if p.get("wait").and_then(Value::as_bool).unwrap_or(false) {
+        let a = analyze_now(s, refresh)?;
+        let (n, secs) = apply_analysis(s, &a, &[])?;
+        toast(s, format!("Montaj Auto Cut: removed {n} cuts ({secs:.0} s). Cmd+Z undoes all of it."), false);
+        return Ok(json!({"applied": n, "removedSeconds": secs, "analysis": suggestions(&a)}));
+    }
+    start_background(s, refresh)
+}
+
+fn apply(s: &mut Session, p: &Value) -> Result<Value> {
+    let id = s.state.active_sequence.ok_or_else(|| err("open a sequence first"))?;
+    let a = cache().lock().ok().and_then(|c| c.get(&id).cloned()).ok_or_else(|| err("run Auto Cut (AI) first"))?;
+    let skip: Vec<usize> = p.get("skip").and_then(Value::as_array).map(|v| v.iter().filter_map(Value::as_u64).map(|n| n as usize).collect()).unwrap_or_default();
+    let (n, secs) = apply_analysis(s, &a, &skip)?;
     if let Ok(mut c) = cache().lock() {
         c.remove(&id);
     }
-    toast(s, format!("Montaj Auto Cut: removed {n} cuts ({:.0} s). Cmd+Z undoes all of it.", removed.seconds()), false);
-    Ok(json!({"applied": n, "skipped": skip.len(), "removedSeconds": removed.seconds()}))
+    toast(s, format!("Montaj Auto Cut: removed {n} cuts ({secs:.0} s). Cmd+Z undoes all of it."), false);
+    Ok(json!({"applied": n, "skipped": skip.len(), "removedSeconds": secs}))
+}
+
+// ------------------------------------------------------------------ background job
+
+const TOTAL: u64 = 1000;
+
+fn set(progress: &Progress, fraction: f32, status: &str) {
+    progress.done.store((fraction.clamp(0.0, 1.0) * TOTAL as f32) as u64, Ordering::Relaxed);
+    if let Ok(mut st) = progress.status.lock() {
+        *st = format!("Montaj Auto Cut: {status}");
+    }
+}
+
+fn start_background(s: &mut Session, refresh: bool) -> Result<Value> {
+    let sequence = s.state.active_sequence.ok_or_else(|| err("open a sequence first"))?;
+    let seq = s.active_sequence().cloned().ok_or_else(|| err("open a sequence first"))?;
+    let project = s.project.clone();
+    let provider = s.media.provider(s.project.clone(), s.services.clone());
+    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
+    let job = Job { id, label: "Montaj Auto Cut".into(), progress: Default::default(), result: Default::default() };
+    let progress = job.progress.clone();
+    progress.total.store(TOTAL, Ordering::Relaxed);
+    set(&progress, 0.0, "mixing the audio");
+    let result: Arc<Mutex<Option<std::result::Result<Analysis, String>>>> = Arc::default();
+    {
+        let (progress, result) = (progress.clone(), result.clone());
+        std::thread::spawn(move || {
+            let cancelled = || progress.cancel.load(Ordering::Relaxed);
+            let out = mix_16k(&project, &seq, &provider, &mut |f| {
+                set(&progress, 0.15 * f, "mixing the audio");
+                !cancelled()
+            })
+            .and_then(|audio| {
+                analysis_for(&audio, refresh, &mut |f, step| {
+                    set(&progress, f, step);
+                    !cancelled()
+                })
+            });
+            if let Ok(mut r) = result.lock() {
+                *r = Some(out);
+            }
+        });
+    }
+    if let Ok(mut r) = running().lock() {
+        *r = Some(Running { job: id, sequence, revision: s.revision, progress, result, job_result: job.result.clone() });
+    }
+    s.jobs.push(job);
+    toast(s, "Montaj Auto Cut started — progress at the bottom right".into(), false);
+    Ok(json!({"job": id}))
+}
+
+/// Per frame: when the background analysis is done, apply it on the main thread.
+fn poll(s: &mut Session) {
+    let finished = {
+        let Ok(mut r) = running().lock() else { return };
+        let done = r.as_ref().and_then(|run| run.result.lock().ok().and_then(|mut x| x.take()));
+        match done {
+            Some(out) => r.take().map(|run| (run, out)),
+            None => None,
+        }
+    };
+    let Some((run, out)) = finished else { return };
+    let finish = |job: std::result::Result<Report, String>| {
+        run.progress.done.store(TOTAL, Ordering::Relaxed);
+        run.progress.finished.store(true, Ordering::Relaxed);
+        if let Ok(mut r) = run.job_result.lock() {
+            *r = Some(job);
+        }
+    };
+    let a = match out {
+        Ok(a) => a,
+        Err(e) => {
+            let msg = if run.progress.cancel.load(Ordering::Relaxed) { "Montaj Auto Cut cancelled".to_string() } else { format!("Montaj Auto Cut failed: {e}") };
+            toast(s, msg.clone(), true);
+            finish(Err(msg));
+            return;
+        }
+    };
+    if let Ok(mut c) = cache().lock() {
+        c.insert(run.sequence, a.clone());
+    }
+    let report = |secs: f64| Report { path: String::new(), frames: a.cuts.len() as u64, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() };
+    // the sequence changed while we were analysing: its times no longer match, let the editor decide
+    if s.state.active_sequence != Some(run.sequence) || s.revision != run.revision {
+        toast(s, format!("Montaj Auto Cut: {} found, but the sequence changed meanwhile — Sequence ▸ Montaj AI ▸ Auto Cut: Apply Again", summary(&a)), false);
+        finish(Ok(report(0.0)));
+        return;
+    }
+    match apply_analysis(s, &a, &[]) {
+        Ok((n, secs)) => {
+            if let Ok(mut c) = cache().lock() {
+                c.remove(&run.sequence);
+            }
+            toast(s, format!("Montaj Auto Cut: removed {n} cuts ({secs:.0} s of {:.0} s). Cmd+Z undoes all of it.", a.duration), false);
+            finish(Ok(report(secs)));
+        }
+        Err(e) => {
+            toast(s, format!("Montaj Auto Cut could not cut: {e}"), true);
+            finish(Err(e.to_string()));
+        }
+    }
+    let _ = run.job;
 }
 
 /// Append one line per suggestion to `<data dir>/montaj/decisions.jsonl`: what was suggested
@@ -230,9 +403,4 @@ fn log_decisions(a: &Analysis, skip: &[usize]) {
         let line = json!({"kind": c.kind, "text": c.text, "reason": c.reason, "seconds": c.end - c.start, "accepted": !skip.contains(&c.id)});
         let _ = writeln!(f, "{line}");
     }
-}
-
-/// A message in the app's status bar (and the Events panel for errors).
-fn toast(s: &mut Session, message: String, error: bool) {
-    s.events.push(filmcraft_engine::Event::Toast { message, error });
 }

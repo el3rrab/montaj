@@ -31,10 +31,14 @@ pub struct Analysis {
 }
 
 /// Run the paid steps (transcript, retakes) and plan the cuts.
-pub fn analyze(audio: &[f32], keys: &Keys, progress: &mut dyn FnMut(&str) -> bool) -> Result<Analysis, AiError> {
+/// `progress(fraction, step)`: transcription runs from 0.15 to 0.8, retakes from 0.8; return
+/// `false` to cancel.
+pub fn analyze(audio: &[f32], keys: &Keys, progress: &mut dyn FnMut(f32, &str) -> bool) -> Result<Analysis, AiError> {
     let t = GeminiTranscriber::from_keys(keys).ok_or(AiError::MissingKey("Gemini", "GEMINI_API_KEY"))?;
-    let (segs, usage) = t.timed(audio, &mut |i, n| progress(&format!("Transcribing with Gemini ({}/{n})", (i + 1).min(n))))?;
-    if !progress("Finding retakes") {
+    let (segs, usage) = t.timed(audio, &mut |i, n| {
+        progress(0.15 + 0.65 * i as f32 / n.max(1) as f32, &format!("transcribing with Gemini ({}/{n})", (i + 1).min(n)))
+    })?;
+    if !progress(0.8, "finding retakes with Claude") {
         return Err(AiError::Cancelled);
     }
     let llm = crate::llm::from_keys(keys)?;
