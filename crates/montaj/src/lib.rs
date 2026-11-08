@@ -3,14 +3,17 @@
 //! [`install`] (call it first thing in `main`) registers Montaj's commands and its per-frame
 //! poll with the engine:
 //!
-//! - `montaj.autocut` — **Sequence ▸ Montaj AI ▸ Auto Cut (AI)**: one step. Runs in the
+//! - `montaj.autocut` — **Sequence ▸ Montaj AI ▸ Auto Cut (AI): Suggest Cuts**. Runs in the
 //!   background as a job (progress bar, step and cancel button in the status bar): mixes the
 //!   active sequence's audio, transcribes it (Gemini), finds retakes and asides (the text
-//!   model), then — back on the main thread, when the job finishes — ripple-deletes every cut in
-//!   ONE undo step. With `{"wait": true}` (CLI, MCP) it runs to the end before returning.
-//! - `montaj.autocut.analyze`: the analysis only, returning the suggested cuts (CLI, MCP).
-//! - `montaj.autocut.apply` — **Auto Cut: Apply**: apply the last analysis (all, or all but
-//!   `skip`).
+//!   model), then puts one coloured duration marker per suggested cut on the timeline. Nothing is
+//!   cut: the editor reviews the markers (the Markers panel is the list) and deletes the ones to
+//!   keep. With `{"wait": true}` (CLI, MCP) it runs to the end before returning.
+//! - `montaj.autocut.applyMarked` — **Apply Marked Cuts**: ripple-delete what the remaining
+//!   suggestion markers cover, in ONE undo step, and log each suggestion as taken or refused.
+//! - `montaj.autocut.clearMarks` — **Clear Suggested Cuts**.
+//! - `montaj.autocut.analyze` / `montaj.autocut.apply`: analysis only / apply every suggestion
+//!   (CLI, MCP).
 //!
 //! Paid analyses are cached on disk by an audio fingerprint, so the same footage is never paid
 //! for twice. Every applied suggestion is logged (taken / refused) for learning the editor's
@@ -26,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use filmcraft_engine::commands::NamedKeys;
 use filmcraft_engine::export::{Progress, Report};
 use filmcraft_engine::{CommandSpec, EngineError, Job, Result, Session};
-use filmcraft_project::{ItemId, Project, Sequence};
+use filmcraft_project::{ItemId, Label, Marker, MarkerId, MarkerKind, Project, Sequence};
 use filmcraft_render::SourceProvider;
 use filmcraft_time::{Tick, TimeRange};
 use montaj_ai::autocut::Analysis;
@@ -51,7 +54,7 @@ fn specs() -> Vec<CommandSpec> {
     vec![
         CommandSpec {
             id: "montaj.autocut",
-            label: "Auto Cut (AI)",
+            label: "Auto Cut (AI): Suggest Cuts",
             menu: MENU,
             shortcut: None,
             params: r#"{"wait":bool?,"refresh":bool?}"#,
@@ -61,9 +64,31 @@ fn specs() -> Vec<CommandSpec> {
             named: NamedKeys::NONE,
         },
         CommandSpec {
-            id: "montaj.autocut.apply",
-            label: "Auto Cut: Apply Again",
+            id: "montaj.autocut.applyMarked",
+            label: "Apply Marked Cuts",
             menu: MENU,
+            shortcut: None,
+            params: "{}",
+            enabled: has_marks,
+            run: apply_marked,
+            journal: true,
+            named: NamedKeys::NONE,
+        },
+        CommandSpec {
+            id: "montaj.autocut.clearMarks",
+            label: "Clear Suggested Cuts",
+            menu: MENU,
+            shortcut: None,
+            params: "{}",
+            enabled: has_marks,
+            run: clear_marks,
+            journal: true,
+            named: NamedKeys::NONE,
+        },
+        CommandSpec {
+            id: "montaj.autocut.apply",
+            label: "Auto Cut: Apply All Suggestions",
+            menu: &[],
             shortcut: None,
             params: r#"{"skip":[int]?}"#,
             enabled: has_analysis,
@@ -270,11 +295,108 @@ fn autocut(s: &mut Session, p: &Value) -> Result<Value> {
     let refresh = p.get("refresh").and_then(Value::as_bool).unwrap_or(false);
     if p.get("wait").and_then(Value::as_bool).unwrap_or(false) {
         let a = analyze_now(s, refresh)?;
-        let (n, secs) = apply_analysis(s, &a, &[])?;
-        toast(s, format!("Montaj Auto Cut: removed {n} cuts ({secs:.0} s). Cmd+Z undoes all of it."), false);
-        return Ok(json!({"applied": n, "removedSeconds": secs, "analysis": suggestions(&a)}));
+        let n = mark_analysis(s, &a)?;
+        toast(s, review_message(&a), false);
+        return Ok(json!({"marked": n, "analysis": suggestions(&a)}));
     }
     start_background(s, refresh)
+}
+
+// ------------------------------------------------------------------ review on the timeline
+
+/// Montaj's suggested-cut markers carry this author and a `[montaj #id]` note.
+const AUTHOR: &str = "Montaj";
+
+fn is_mark(m: &Marker) -> bool {
+    m.author == AUTHOR && m.comment.starts_with("[montaj #")
+}
+
+/// The cut id in a marker's note (`[montaj #12] …`).
+fn mark_cut_id(m: &Marker) -> Option<usize> {
+    m.comment.strip_prefix("[montaj #")?.split(']').next()?.parse().ok()
+}
+
+fn kind_label(kind: &str) -> (&'static str, Label) {
+    match kind {
+        "retake" => ("✂ إعادة", Label::Rose),
+        "aside" => ("✂ كلام جانبي", Label::Purple),
+        "stutter" => ("✂ تلعثم", Label::Mango),
+        "filler" => ("✂ حشو", Label::Mango),
+        "false start" => ("✂ بداية مقطوعة", Label::Mango),
+        "noise" => ("✂ صوت", Label::Tan),
+        _ => ("✂ سكتة", Label::Yellow),
+    }
+}
+
+fn review_message(a: &Analysis) -> String {
+    format!(
+        "Montaj: {} marked on the timeline. Review them in the Markers panel, delete the markers of cuts you want to keep, then Sequence ▸ Montaj AI ▸ Apply Marked Cuts",
+        summary(a)
+    )
+}
+
+/// Put one duration marker per suggested cut on the active sequence (replacing earlier ones).
+fn mark_analysis(s: &mut Session, a: &Analysis) -> Result<usize> {
+    let cuts = a.cuts.clone();
+    s.edit_sequence("Auto Cut: Suggest Cuts", move |q, ctx, _| {
+        q.markers.retain(|m| !is_mark(m));
+        for c in &cuts {
+            let (name, color) = kind_label(&c.kind);
+            let words: String = c.text.chars().take(60).collect();
+            q.markers.push(Marker {
+                url: String::new(),
+                author: AUTHOR.into(),
+                custom_color: None,
+                id: MarkerId(ctx.alloc()),
+                start: Tick::from_seconds_f64(c.start),
+                duration: Tick::from_seconds_f64(c.end) - Tick::from_seconds_f64(c.start),
+                name: if words.is_empty() { name.to_string() } else { format!("{name}: {words}") },
+                comment: format!("[montaj #{}] {}", c.id, c.reason),
+                kind: MarkerKind::Comment,
+                color,
+            });
+        }
+        q.markers.sort_by_key(|m| m.start);
+        Ok(cuts.len())
+    })
+}
+
+fn has_marks(s: &Session) -> std::result::Result<(), String> {
+    has_sequence(s)?;
+    let any = s.active_sequence().is_some_and(|q| q.markers.iter().any(is_mark));
+    if any { Ok(()) } else { Err("no suggested cuts on this sequence (run Auto Cut (AI): Suggest Cuts)".into()) }
+}
+
+/// Cut what the marked suggestions cover, in one undo step; the editor deleted the markers of the
+/// cuts to keep. Logs taken / refused against the last analysis of this sequence.
+fn apply_marked(s: &mut Session, _: &Value) -> Result<Value> {
+    let id = s.state.active_sequence.ok_or_else(|| err("open a sequence first"))?;
+    let marks: Vec<(Option<usize>, TimeRange)> = s
+        .active_sequence()
+        .map(|q| q.markers.iter().filter(|m| is_mark(m)).map(|m| (mark_cut_id(m), TimeRange::from_bounds(m.start, m.start + m.duration))).collect())
+        .unwrap_or_default();
+    let kept_ids: Vec<usize> = marks.iter().filter_map(|(i, _)| *i).collect();
+    let ranges: Vec<TimeRange> = marks.into_iter().map(|(_, r)| r).filter(|r| r.duration > Tick::ZERO).collect();
+    let n = ranges.len();
+    let removed = s.edit_sequence("Apply Marked Cuts", move |q, ctx, _| {
+        q.markers.retain(|m| !is_mark(m));
+        Ok(filmcraft_edit::transcript::ripple_delete_ranges(q, ranges, ctx))
+    })?;
+    if let Some(a) = cache().lock().ok().and_then(|mut c| c.remove(&id)) {
+        let refused: Vec<usize> = a.cuts.iter().map(|c| c.id).filter(|i| !kept_ids.contains(i)).collect();
+        log_decisions(&a, &refused);
+    }
+    toast(s, format!("Montaj: removed {n} cuts ({:.0} s). Cmd+Z undoes all of it.", removed.seconds()), false);
+    Ok(json!({"applied": n, "removedSeconds": removed.seconds()}))
+}
+
+fn clear_marks(s: &mut Session, _: &Value) -> Result<Value> {
+    let n = s.edit_sequence("Clear Suggested Cuts", |q, _, _| {
+        let before = q.markers.len();
+        q.markers.retain(|m| !is_mark(m));
+        Ok(before - q.markers.len())
+    })?;
+    Ok(json!({"cleared": n}))
 }
 
 fn apply(s: &mut Session, p: &Value) -> Result<Value> {
@@ -371,20 +493,18 @@ fn poll(s: &mut Session) {
     let report = |secs: f64| Report { path: String::new(), frames: a.cuts.len() as u64, seconds: secs, bytes: 0, render_fps: 0.0, extra_files: Vec::new() };
     // the sequence changed while we were analysing: its times no longer match, let the editor decide
     if s.state.active_sequence != Some(run.sequence) || s.revision != run.revision {
-        toast(s, format!("Montaj Auto Cut: {} found, but the sequence changed meanwhile — Sequence ▸ Montaj AI ▸ Auto Cut: Apply Again", summary(&a)), false);
+        toast(s, format!("Montaj Auto Cut: {} found, but the sequence changed meanwhile, so nothing was marked — run Auto Cut (AI) again", summary(&a)), false);
         finish(Ok(report(0.0)));
         return;
     }
-    match apply_analysis(s, &a, &[]) {
-        Ok((n, secs)) => {
-            if let Ok(mut c) = cache().lock() {
-                c.remove(&run.sequence);
-            }
-            toast(s, format!("Montaj Auto Cut: removed {n} cuts ({secs:.0} s of {:.0} s). Cmd+Z undoes all of it.", a.duration), false);
-            finish(Ok(report(secs)));
+    // suggestions, not cuts: the editor reviews the markers and applies what stays
+    match mark_analysis(s, &a) {
+        Ok(_) => {
+            toast(s, review_message(&a), false);
+            finish(Ok(report(0.0)));
         }
         Err(e) => {
-            toast(s, format!("Montaj Auto Cut could not cut: {e}"), true);
+            toast(s, format!("Montaj Auto Cut could not mark the cuts: {e}"), true);
             finish(Err(e.to_string()));
         }
     }
