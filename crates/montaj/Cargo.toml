@@ -1,0 +1,20 @@
+[package]
+name = "montaj"
+description = "Montaj inside FilmCraft: registers Montaj's commands (AI auto-cut) and installs the cloud transcriber"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+filmcraft-engine = { workspace = true }
+filmcraft-edit = { workspace = true }
+filmcraft-project = { workspace = true }
+filmcraft-render = { workspace = true }
+filmcraft-time = { workspace = true }
+filmcraft-speech = { workspace = true }
+montaj-ai = { path = "../montaj-ai" }
+serde_json = { workspace = true }

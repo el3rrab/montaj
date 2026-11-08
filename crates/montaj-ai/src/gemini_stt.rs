@@ -196,22 +196,28 @@ impl GeminiTranscriber {
         let mut all = Vec::new();
         let mut total = Usage::default();
         let n = pieces.len();
-        for (i, r) in pieces.into_iter().enumerate() {
-            if !progress(i, n) {
+        // up to PARALLEL requests at once: a 25-minute recording is ~25 pieces
+        for (b, batch) in pieces.chunks(PARALLEL).enumerate() {
+            if !progress(b * PARALLEL, n) {
                 return Err(AiError::Cancelled);
             }
-            let offset = r.start as f64 / sr as f64;
-            let len = r.len() as f64 / sr as f64;
-            let (mut segs, u) = self.chunk(&audio[r])?;
-            fit_to_length(&mut segs, len);
-            for s in &mut segs {
-                s.start += offset;
-                s.end += offset;
+            let results: Vec<Result<(Vec<Segment>, Usage), AiError>> = std::thread::scope(|sc| {
+                let handles: Vec<_> = batch.iter().map(|r| sc.spawn(|| self.chunk(&audio[r.clone()]))).collect();
+                handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(AiError::Io("transcription thread failed".into())))).collect()
+            });
+            for (r, res) in batch.iter().zip(results) {
+                let (mut segs, u) = res?;
+                let offset = r.start as f64 / sr as f64;
+                fit_to_length(&mut segs, r.len() as f64 / sr as f64);
+                for s in &mut segs {
+                    s.start += offset;
+                    s.end += offset;
+                }
+                all.extend(segs);
+                total.input += u.input;
+                total.output += u.output;
+                total.thinking += u.thinking;
             }
-            all.extend(segs);
-            total.input += u.input;
-            total.output += u.output;
-            total.thinking += u.thinking;
         }
         let voice = voice_ranges(audio, 0.12, 0.08, 3600.0, 0.0);
         snap_to_voice(&mut all, &voice, sr as f64, 0.6);
@@ -263,6 +269,9 @@ impl GeminiTranscriber {
 
 /// Longest piece sent for a timed transcript.
 pub const TIMED_PIECE_SECONDS: usize = 60;
+
+/// Requests sent to Gemini at the same time.
+const PARALLEL: usize = 6;
 
 /// Drop segments with bad times and, when the last end overruns the piece's real length,
 /// stretch every time by `len / last_end` (Gemini's clock ran fast).

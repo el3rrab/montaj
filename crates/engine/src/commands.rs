@@ -88,10 +88,22 @@ macro_rules! query {
     };
 }
 
+/// Commands an embedding app adds to the registry (Montaj): set once, before the registry is
+/// first built (the start of `main`); a later call is refused.
+static EXTRA: OnceLock<fn() -> Vec<CommandSpec>> = OnceLock::new();
+
+/// Register extra commands (see [`EXTRA`]). Returns `false` if some were already registered.
+pub fn register_extra(specs: fn() -> Vec<CommandSpec>) -> bool {
+    EXTRA.set(specs).is_ok()
+}
+
 pub fn command_specs() -> &'static [CommandSpec] {
     static SPECS: OnceLock<Vec<CommandSpec>> = OnceLock::new();
     SPECS.get_or_init(|| {
         let mut v = build();
+        if let Some(extra) = EXTRA.get() {
+            v.extend(extra());
+        }
         for c in &mut v {
             c.named = if SELECTION_ONLY.contains(&c.id) { NamedKeys::NONE } else { NamedKeys::from_doc(c.params) };
         }

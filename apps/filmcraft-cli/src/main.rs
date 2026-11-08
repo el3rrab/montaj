@@ -184,7 +184,7 @@ impl Backend {
         }
         // Montaj: speech-to-text through OpenAI when a key is set (crates/montaj-ai)
         let data = a.opt("--data-dir").map(std::path::PathBuf::from).or_else(filmcraft_engine::autosave::default_data_dir);
-        s.transcriber = montaj_ai::transcribe::installed(data.as_deref());
+        s.transcriber = montaj::transcriber(data.as_deref());
         if let Some(p) = a.opt("--project") {
             if let Err(e) = s.execute("file.open", json!({"path": p})) {
                 fail(e);
@@ -300,6 +300,8 @@ fn absolute(path: &str) -> String {
 
 #[tokio::main]
 async fn main() {
+    // Montaj: register Montaj's commands before anything reads the command registry
+    montaj::install();
     cli().await;
     if STDOUT_ERROR.load(Ordering::Relaxed) {
         std::process::exit(1);

@@ -80,6 +80,8 @@ fn tell(text: &str, error: bool) {
 }
 
 fn main() -> eframe::Result {
+    // Montaj: register Montaj's commands before anything reads the command registry
+    montaj::install();
     // Windows: the update helper is a copy of this program started with `--finish-update`.
     #[cfg(windows)]
     if let Some(result) = craft_update::self_update::finish(&filmcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>()) {
@@ -231,7 +233,7 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         );
         let mut session = Session::default();
         // Montaj: speech-to-text through OpenAI when a key is set (crates/montaj-ai)
-        session.transcriber = montaj_ai::transcribe::installed(data_dir.clone().or_else(default_data_dir).as_deref());
+        session.transcriber = montaj::transcriber(data_dir.clone().or_else(default_data_dir).as_deref());
         if let Some(dir) = data_dir.clone().or_else(default_data_dir) {
             let mut cfg = AutosaveConfig::new(dir);
             cfg.local_offset = local_offset;

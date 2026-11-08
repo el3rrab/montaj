@@ -18,8 +18,8 @@ whisper = ["filmcraft-engine/whisper", "filmcraft-engine/speech-download"]
 neural-voices = ["filmcraft-engine/neural-voices"]
 
 [dependencies]
-# Montaj: cloud AI (crates/montaj-ai)
-montaj-ai = { path = "../../crates/montaj-ai" }
+# Montaj: commands and cloud AI (crates/montaj)
+montaj = { path = "../../crates/montaj" }
 filmcraft-engine = { workspace = true }
 filmcraft-export = { workspace = true }
 filmcraft-project = { workspace = true }
