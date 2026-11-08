@@ -126,8 +126,9 @@ impl Llm for Claude {
         if self.fallbacks() {
             headers.push(("anthropic-beta", "server-side-fallback-2026-07-01"));
         }
-        let reply = http::post_json("Claude", ANTHROPIC_URL, &headers, &self.body(req))?;
-        claude_text(&http::check("Claude", reply)?)
+        let body = self.body(req);
+        let text = crate::limits::with_retry(4, || http::check("Claude", http::post_json("Claude", ANTHROPIC_URL, &headers, &body)?))?;
+        claude_text(&text)
     }
 }
 
@@ -157,8 +158,8 @@ impl Llm for OpenAi {
             "max_completion_tokens": req.max_tokens,
             "messages": [{"role": "system", "content": req.system}, {"role": "user", "content": req.user}],
         });
-        let reply = http::post_json("OpenAI", OPENAI_URL, &[("authorization", &auth)], &body)?;
-        openai_text(&http::check("OpenAI", reply)?)
+        let text = crate::limits::with_retry(4, || http::check("OpenAI", http::post_json("OpenAI", OPENAI_URL, &[("authorization", &auth)], &body)?))?;
+        openai_text(&text)
     }
 }
 
@@ -189,8 +190,11 @@ impl Llm for Gemini {
             "contents": [{"role": "user", "parts": [{"text": req.user}]}],
             "generationConfig": {"maxOutputTokens": req.max_tokens},
         });
-        let reply = http::post_json("Gemini", &url, &[("x-goog-api-key", &self.key)], &body)?;
-        gemini_text(&http::check("Gemini", reply)?)
+        let text = crate::limits::with_retry(4, || {
+            crate::limits::gemini().acquire();
+            http::check("Gemini", http::post_json("Gemini", &url, &[("x-goog-api-key", &self.key)], &body)?)
+        })?;
+        gemini_text(&text)
     }
 }
 

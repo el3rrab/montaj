@@ -182,8 +182,11 @@ impl GeminiTranscriber {
             },
         });
         let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", self.model);
-        let reply = http::post_json("Gemini", &url, &[("x-goog-api-key", &self.key)], &body)?;
-        parse(&http::check("Gemini", reply)?)
+        let text = crate::limits::with_retry(6, || {
+            crate::limits::gemini().acquire();
+            http::check("Gemini", http::post_json("Gemini", &url, &[("x-goog-api-key", &self.key)], &body)?)
+        })?;
+        parse(&text)
     }
 
     /// Timed transcript of `audio` with reliable times: sent in pieces of at most
@@ -260,15 +263,17 @@ impl GeminiTranscriber {
             },
         });
         let url = format!("https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent", self.model);
-        let reply = http::post_json("Gemini", &url, &[("x-goog-api-key", &self.key)], &body)?;
-        let body = http::check("Gemini", reply)?;
+        let body = crate::limits::with_retry(6, || {
+            crate::limits::gemini().acquire();
+            http::check("Gemini", http::post_json("Gemini", &url, &[("x-goog-api-key", &self.key)], &body)?)
+        })?;
         let (answers, usage) = parse_clips(&body)?;
         Ok((clip_segments(ranges, answers), usage))
     }
 }
 
 /// Longest piece sent for a timed transcript.
-pub const TIMED_PIECE_SECONDS: usize = 60;
+pub const TIMED_PIECE_SECONDS: usize = 120;
 
 /// Requests sent to Gemini at the same time.
 const PARALLEL: usize = 6;

@@ -17,6 +17,7 @@ pub mod autocut;
 pub mod cutplan;
 pub mod gemini_stt;
 pub mod keys;
+pub mod limits;
 pub mod llm;
 pub mod retakes;
 pub mod transcribe;

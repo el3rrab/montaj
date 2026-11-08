@@ -159,7 +159,13 @@ fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
         Some(a) => a,
         None => {
             let keys = Keys::load(data_dir().as_deref());
-            let a = montaj_ai::autocut::analyze(&audio, &keys, &mut |_| true).map_err(err)?;
+            let a = match montaj_ai::autocut::analyze(&audio, &keys, &mut |_| true) {
+                Ok(a) => a,
+                Err(e) => {
+                    toast(s, format!("Montaj Auto Cut failed: {e}"), true);
+                    return Err(err(e));
+                }
+            };
             if let Some(p) = &disk
                 && let Some(dir) = p.parent()
                 && std::fs::create_dir_all(dir).is_ok()
@@ -171,6 +177,19 @@ fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
         }
     };
     let out = suggestions(&a);
+    let cut: f64 = a.cuts.iter().map(|c| c.end - c.start).sum();
+    let retakes = a.cuts.iter().filter(|c| c.kind != "pause").count();
+    toast(
+        s,
+        format!(
+            "Montaj Auto Cut: {} cuts suggested ({retakes} retakes/asides, {} pauses), {:.0} s of {:.0} s. Next: Sequence ▸ Montaj AI ▸ Auto Cut: Apply",
+            a.cuts.len(),
+            a.cuts.len() - retakes,
+            cut,
+            a.duration
+        ),
+        false,
+    );
     if let Ok(mut c) = cache().lock() {
         c.insert(id, a);
     }
@@ -195,6 +214,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     if let Ok(mut c) = cache().lock() {
         c.remove(&id);
     }
+    toast(s, format!("Montaj Auto Cut: removed {n} cuts ({:.0} s). Cmd+Z undoes all of it.", removed.seconds()), false);
     Ok(json!({"applied": n, "skipped": skip.len(), "removedSeconds": removed.seconds()}))
 }
 
@@ -210,4 +230,9 @@ fn log_decisions(a: &Analysis, skip: &[usize]) {
         let line = json!({"kind": c.kind, "text": c.text, "reason": c.reason, "seconds": c.end - c.start, "accepted": !skip.contains(&c.id)});
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// A message in the app's status bar (and the Events panel for errors).
+fn toast(s: &mut Session, message: String, error: bool) {
+    s.events.push(filmcraft_engine::Event::Toast { message, error });
 }
