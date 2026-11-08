@@ -182,6 +182,9 @@ impl Backend {
         if let Some(dir) = a.opt("--data-dir").map(std::path::PathBuf::from).or_else(filmcraft_engine::autosave::default_data_dir) {
             s.export_presets.set_dir(&dir);
         }
+        // Montaj: speech-to-text through OpenAI when a key is set (crates/montaj-ai)
+        let data = a.opt("--data-dir").map(std::path::PathBuf::from).or_else(filmcraft_engine::autosave::default_data_dir);
+        s.transcriber = montaj_ai::transcribe::installed(data.as_deref());
         if let Some(p) = a.opt("--project") {
             if let Err(e) = s.execute("file.open", json!({"path": p})) {
                 fail(e);

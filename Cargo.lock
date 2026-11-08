@@ -1902,6 +1902,7 @@ dependencies = [
  "filmcraft-ui-egui",
  "glob",
  "log",
+ "montaj-ai",
  "muda",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
@@ -2030,6 +2031,7 @@ dependencies = [
  "filmcraft-render",
  "filmcraft-testkit",
  "filmcraft-time",
+ "montaj-ai",
  "serde_json",
  "tokio",
 ]
@@ -4105,6 +4107,21 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "montaj-ai"
+version = "0.18.0"
+dependencies = [
+ "filmcraft-project",
+ "filmcraft-speech",
+ "filmcraft-time",
+ "rustls-rustcrypto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "ureq",
 ]
 
 [[package]]

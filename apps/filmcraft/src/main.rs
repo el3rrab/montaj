@@ -230,6 +230,8 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
             }),
         );
         let mut session = Session::default();
+        // Montaj: speech-to-text through OpenAI when a key is set (crates/montaj-ai)
+        session.transcriber = montaj_ai::transcribe::installed(data_dir.clone().or_else(default_data_dir).as_deref());
         if let Some(dir) = data_dir.clone().or_else(default_data_dir) {
             let mut cfg = AutosaveConfig::new(dir);
             cfg.local_offset = local_offset;

@@ -1,0 +1,24 @@
+[package]
+name = "montaj-ai"
+description = "Montaj: cloud AI providers (Claude, OpenAI, Gemini) for FilmCraft — speech-to-text with word times, and a text model interface for editing decisions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+filmcraft-time = { workspace = true }
+filmcraft-project = { workspace = true }
+filmcraft-speech = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# HTTPS with pure-Rust TLS and the OS certificate verifier, as filmcraft-speech's downloader.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
+rustls-rustcrypto = "0.0.2-alpha"
+
+[dev-dependencies]
+tempfile = "3.27"
