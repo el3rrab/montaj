@@ -241,6 +241,48 @@ pub fn extend_to_restart(segs: &[Segment], drops: &[Drop], window: f64) -> Vec<D
     added
 }
 
+/// Short words that carry no content, left out when comparing what two lines say.
+const STOP: &[&str] = &["في", "من", "على", "ان", "انه", "ده", "دي", "اللي", "كان", "ما", "مش", "لا", "يا", "او", "بس", "كده", "يعني", "هو", "هي", "انا", "احنا", "مع", "عن", "لو"];
+
+fn content_stems(text: &str) -> Vec<String> {
+    let stop: Vec<String> = STOP.iter().map(|w| stem(w)).collect();
+    text.split_whitespace().map(stem).filter(|w| w.chars().count() >= 3 && !stop.contains(w)).collect()
+}
+
+/// Free, local check on the model's work, so nothing said only once is cut:
+/// - a retake line is only cut when at least half of its content words come back in lines that
+///   stay, within `window` seconds after it (one-word fragments of a cut passage are trusted);
+/// - an aside is only cut when the transcriber also heard an aside, or when it is a short line
+///   that addresses someone ("يا …").
+pub fn verify(segs: &[Segment], drops: Vec<Drop>, window: f64) -> Vec<Drop> {
+    let dropped: Vec<usize> = drops.iter().map(|d| d.line).collect();
+    drops
+        .into_iter()
+        .filter(|d| {
+            let Some(s) = segs.get(d.line) else { return false };
+            if d.kind == "aside" {
+                let words = s.text.split_whitespace().count();
+                return s.kind == "aside" || (words <= 10 && s.text.split_whitespace().any(|w| norm_word(w) == "يا"));
+            }
+            let mine = content_stems(&s.text);
+            if mine.len() <= 1 {
+                return true;
+            }
+            let later: Vec<String> = segs
+                .iter()
+                .enumerate()
+                .filter(|(j, t)| *j > d.line && !dropped.contains(j) && t.start >= s.end - 1e-9 && t.start - s.end <= window)
+                .flat_map(|(_, t)| content_stems(&t.text))
+                .collect();
+            let found = mine
+                .iter()
+                .filter(|w| later.iter().any(|x| x == *w || (w.chars().count() >= 4 && (x.starts_with(w.as_str()) || w.starts_with(x.as_str())))))
+                .count();
+            found * 2 >= mine.len()
+        })
+        .collect()
+}
+
 /// Ask `llm` which segments are superseded retakes.
 pub fn find(llm: &dyn Llm, segs: &[Segment]) -> Result<Vec<Drop>, AiError> {
     if segs.is_empty() {
@@ -316,6 +358,25 @@ mod tests {
         assert_eq!(added.iter().map(|a| a.line).collect::<Vec<_>>(), vec![2, 3]);
         // nothing restarts it within the window: nothing added
         assert!(extend_to_restart(&segs, &[Drop { line: 4, kind: "retake".into(), reason: String::new() }], 40.0).is_empty());
+    }
+
+    #[test]
+    fn verify_keeps_what_is_never_said_again_and_false_asides() {
+        let segs = vec![
+            Segment::new(0.0, 3.0, "راح لواحد صاحبه دكتور نفسي مشهور"),
+            Segment::new(4.0, 6.0, "كان قدامه خيارين يحول شركته لإنتاج برامج تلفزيون"),
+            Segment::new(7.0, 8.0, "خلاص يا جو؟"),
+            Segment::new(9.0, 9.5, "فكرة"),
+            Segment::new(20.0, 24.0, "وراح لواحد صاحبه انتيم دكتور نفسي مشهور جدا"),
+        ];
+        let d = |line, kind: &str| Drop { line, kind: kind.into(), reason: String::new() };
+        let kept = verify(&segs, vec![d(0, "retake"), d(1, "aside"), d(2, "aside"), d(3, "retake")], 240.0);
+        // 0: said again at 20 s → cut; 1: content, not an aside → kept; 2: a short address → cut;
+        // 3: a one-word fragment → trusted
+        assert_eq!(kept.iter().map(|d| d.line).collect::<Vec<_>>(), vec![0, 2, 3]);
+        // a "retake" whose content never comes back is not cut
+        let lone = vec![Segment::new(0.0, 3.0, "منرو قال له يا دكتور أنا بشوف نفسي من سقف الاوضه"), Segment::new(5.0, 6.0, "حاجة تانية خالص")];
+        assert!(verify(&lone, vec![d(0, "retake")], 240.0).is_empty());
     }
 
     #[test]

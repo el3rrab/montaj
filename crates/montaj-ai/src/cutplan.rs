@@ -16,11 +16,19 @@ pub struct CutOptions {
     pub air: f64,
     /// Pieces shorter than this are dropped (clicks, breaths).
     pub min_piece: f64,
+    /// Only audio this many dB under the voice threshold counts as silence when shortening
+    /// pauses, so soft word endings and breathy syllables are never taken for a pause.
+    pub quiet_db: f32,
+    /// Voiced stretches at least this long that the transcript missed are kept when they sit
+    /// between kept speech (0 = off).
+    pub min_voice: f64,
 }
 
 impl Default for CutOptions {
     fn default() -> Self {
-        Self { pad_before: 0.08, pad_after: 0.15, max_pause: 0.35, air: 0.12, min_piece: 0.15 }
+        // tuned on a 31-minute raw recording (montaj-replan): wider pads, only real pauses
+        // shortened to a natural breath, and voice the transcript missed is kept
+        Self { pad_before: 0.15, pad_after: 0.25, max_pause: 0.8, air: 0.25, min_piece: 0.15, quiet_db: 6.0, min_voice: 0.3 }
     }
 }
 
@@ -66,8 +74,57 @@ pub fn keep_ranges(audio_16k: &[f32], segs: &[Segment], drop: &[usize], o: &CutO
             _ => ranges.push((a, b)),
         }
     }
-    let ranges = shorten_pauses(audio_16k, &ranges, o);
+    // voice the transcript missed, between two kept segments: not understood, so not cut
+    for (a, b) in untranscribed_voice(audio_16k, &spans, o.min_voice) {
+        ranges.push(((a - o.pad_before).max(0.0), (b + o.pad_after).min(dur)));
+    }
+    ranges.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for (a, b) in ranges {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 + 0.05 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
+    let ranges = shorten_pauses(audio_16k, &merged, o);
     ranges.into_iter().filter(|(a, b)| b - a >= o.min_piece).collect()
+}
+
+/// Voiced stretches (≥ `min_len` s) that no segment covers and that lie between two kept
+/// segments: speech the transcript missed. Inside a cut passage they are left to be cut.
+fn untranscribed_voice(audio_16k: &[f32], spans: &[(f64, f64, bool)], min_len: f64) -> Vec<(f64, f64)> {
+    if min_len <= 0.0 {
+        return Vec::new();
+    }
+    let db = filmcraft_speech::vad::frame_db(audio_16k);
+    if db.is_empty() {
+        return Vec::new();
+    }
+    let th = filmcraft_speech::vad::threshold(&db);
+    let covered = |t: f64| spans.iter().any(|&(s, e, _)| t >= s && t < e);
+    let mut out = Vec::new();
+    let mut f = 0;
+    while f < db.len() {
+        let t = f as f64 / 100.0;
+        if db[f] < th || covered(t) {
+            f += 1;
+            continue;
+        }
+        let a = f;
+        while f < db.len() && db[f] >= th && !covered(f as f64 / 100.0) {
+            f += 1;
+        }
+        let (s, e) = (a as f64 / 100.0, f as f64 / 100.0);
+        if e - s < min_len {
+            continue;
+        }
+        let prev = spans.iter().filter(|x| x.1 <= s + 1e-9).max_by(|x, y| x.1.total_cmp(&y.1));
+        let next = spans.iter().filter(|x| x.0 >= e - 1e-9).min_by(|x, y| x.0.total_cmp(&y.0));
+        if prev.is_some_and(|p| p.2) && next.is_some_and(|n| n.2) {
+            out.push((s, e));
+        }
+    }
+    out
 }
 
 /// Split each range at silences longer than `max_pause`, leaving `air` on both sides.
@@ -76,7 +133,7 @@ fn shorten_pauses(audio_16k: &[f32], ranges: &[(f64, f64)], o: &CutOptions) -> V
     if db.is_empty() {
         return ranges.to_vec();
     }
-    let th = filmcraft_speech::vad::threshold(&db);
+    let th = filmcraft_speech::vad::threshold(&db) - o.quiet_db;
     const FRAME: f64 = 0.01; // frame_db works in 10 ms frames
     let min_run = ((o.max_pause + 2.0 * o.air) / FRAME).ceil() as usize;
     let mut out = Vec::new();
@@ -110,6 +167,11 @@ fn shorten_pauses(audio_16k: &[f32], ranges: &[(f64, f64)], o: &CutOptions) -> V
 mod tests {
     use super::*;
 
+    /// The tight settings these tests were written for.
+    fn tight() -> CutOptions {
+        CutOptions { pad_before: 0.08, pad_after: 0.15, max_pause: 0.35, air: 0.12, min_piece: 0.15, quiet_db: 0.0, min_voice: 0.0 }
+    }
+
     /// `seconds` of near-silence with a loud tone over each `(from, to)`.
     fn audio(seconds: f64, tones: &[(f64, f64)]) -> Vec<f32> {
         let n = (seconds * 16_000.0) as usize;
@@ -130,7 +192,7 @@ mod tests {
     fn drops_retakes_and_disfluencies_and_keeps_padding_out_of_them() {
         let a = audio(10.0, &[(1.0, 2.0), (2.1, 2.5), (3.0, 4.0), (5.0, 6.0)]);
         let segs = vec![seg(1.0, 2.0, "speech"), seg(2.1, 2.5, "stutter"), seg(3.0, 4.0, "speech"), seg(5.0, 6.0, "speech")];
-        let r = keep_ranges(&a, &segs, &[2], &CutOptions::default());
+        let r = keep_ranges(&a, &segs, &[2], &tight());
         assert_eq!(r.len(), 2, "{r:?}");
         // padding after segment 0 stops where the stutter starts
         assert!((r[0].0 - 0.92).abs() < 1e-9 && (r[0].1 - 2.1).abs() < 1e-9, "{r:?}");
@@ -144,20 +206,37 @@ mod tests {
     fn long_pause_inside_a_kept_segment_is_shortened() {
         // one segment from 1 to 5 s, but silent from 2 to 4 s
         let a = audio(6.0, &[(1.0, 2.0), (4.0, 5.0)]);
-        let r = keep_ranges(&a, &[seg(1.0, 5.0, "speech")], &[], &CutOptions::default());
+        let r = keep_ranges(&a, &[seg(1.0, 5.0, "speech")], &[], &tight());
         assert_eq!(r.len(), 2, "{r:?}");
         assert!((r[0].1 - 2.12).abs() < 0.03, "{r:?}");
         assert!((r[1].0 - 3.88).abs() < 0.03, "{r:?}");
         // a short breath stays
         let b = audio(4.0, &[(1.0, 2.0), (2.2, 3.0)]);
-        assert_eq!(keep_ranges(&b, &[seg(1.0, 3.0, "speech")], &[], &CutOptions::default()).len(), 1);
+        assert_eq!(keep_ranges(&b, &[seg(1.0, 3.0, "speech")], &[], &tight()).len(), 1);
+    }
+
+    #[test]
+    fn voice_the_transcript_missed_between_kept_speech_stays() {
+        // speech 1-2 s (segment), voice 2.6-3.4 s with no segment, speech 4-5 s (segment),
+        // then voice 6.0-6.8 s with no segment before a dropped retake at 7-8 s
+        let a = audio(9.0, &[(1.0, 2.0), (2.6, 3.4), (4.0, 5.0), (6.0, 6.8), (7.0, 8.0)]);
+        let segs = vec![seg(1.0, 2.0, "speech"), seg(4.0, 5.0, "speech"), seg(7.0, 8.0, "speech")];
+        let o = CutOptions { min_voice: 0.3, max_pause: 5.0, ..tight() };
+        let r = keep_ranges(&a, &segs, &[2], &o);
+        let kept = |t: f64| r.iter().any(|&(s, e)| t >= s && t < e);
+        assert!(kept(3.0), "missed voice between kept speech is kept: {r:?}");
+        assert!(!kept(6.4), "missed voice next to a dropped retake is left to be cut: {r:?}");
+        assert!(!kept(7.5));
+        // off: the missed voice is cut
+        let r0 = keep_ranges(&a, &segs, &[2], &CutOptions { min_voice: 0.0, ..o });
+        assert!(!r0.iter().any(|&(s, e)| 3.0 >= s && 3.0 < e));
     }
 
     #[test]
     fn bad_times_are_ignored() {
         let a = audio(2.0, &[(0.5, 1.0)]);
         let segs = vec![seg(f64::NAN, 1.0, "speech"), seg(1.5, 1.2, "speech"), seg(0.5, 1.0, "speech")];
-        assert_eq!(keep_ranges(&a, &segs, &[], &CutOptions::default()).len(), 1);
-        assert!(keep_ranges(&[], &segs, &[], &CutOptions::default()).is_empty());
+        assert_eq!(keep_ranges(&a, &segs, &[], &tight()).len(), 1);
+        assert!(keep_ranges(&[], &segs, &[], &tight()).is_empty());
     }
 }

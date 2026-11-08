@@ -47,7 +47,9 @@ pub fn analyze(audio: &[f32], keys: &Keys, progress: &mut dyn FnMut(f32, &str) -
 }
 
 /// The free part: local rules, partial cuts, the ranges to keep and the cut list.
-pub fn plan(audio: &[f32], segs: Vec<Segment>, mut drops: Vec<Drop>, usage: Usage) -> Analysis {
+pub fn plan(audio: &[f32], segs: Vec<Segment>, drops: Vec<Drop>, usage: Usage) -> Analysis {
+    // check the model's work locally: nothing said only once is cut, asides must really be asides
+    let mut drops = retakes::verify(&segs, drops, 240.0);
     let model_lines: Vec<usize> = drops.iter().map(|d| d.line).collect();
     drops.extend(retakes::repeated_openings(&segs, &model_lines, 3, 30.0));
     drops.sort_by_key(|d| d.line);
@@ -99,6 +101,11 @@ fn cuts_between(keep: &[(f64, f64)], duration: f64, segs: &[Segment], drops: &[D
                         text.push(s.text.clone());
                     }
                 }
+            }
+            // mostly silence (a long gap with a cough or an "آآ" in it) reads as a pause
+            let said: f64 = inside.iter().map(|(_, s)| s.end.min(b) - s.start.max(a)).sum();
+            if matches!(kind.as_str(), "filler" | "noise") && said < 0.4 * (b - a) {
+                kind = "pause".into();
             }
             Cut { id, start: a, end: b, kind, text: text.join(" "), reason }
         })
