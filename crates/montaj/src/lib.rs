@@ -10,7 +10,8 @@
 //!   undo step, and log which suggestions were taken or refused (the start of learning the
 //!   editor's taste).
 //!
-//! Both appear in the Montaj menu, the CLI and the MCP server like any FilmCraft command.
+//! Both appear in Sequence ▸ Montaj AI, the CLI and the MCP server like any FilmCraft command
+//! (FilmCraft's menu bar has a fixed set of top-level menus).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
@@ -41,7 +42,7 @@ fn specs() -> Vec<CommandSpec> {
         CommandSpec {
             id: "montaj.autocut.analyze",
             label: "Auto Cut: Analyze (AI)",
-            menu: &["Montaj"],
+            menu: &["Sequence", "Montaj AI"],
             shortcut: None,
             params: r#"{"refresh":bool?}"#,
             enabled: has_sequence,
@@ -52,7 +53,7 @@ fn specs() -> Vec<CommandSpec> {
         CommandSpec {
             id: "montaj.autocut.apply",
             label: "Auto Cut: Apply",
-            menu: &["Montaj"],
+            menu: &["Sequence", "Montaj AI"],
             shortcut: None,
             params: r#"{"skip":[int]?}"#,
             enabled: has_analysis,
