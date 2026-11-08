@@ -26,7 +26,7 @@ fn main() {
             let start = it.next()?.parse().ok()?;
             let end = it.next()?.parse().ok()?;
             let rest: Vec<&str> = it.collect();
-            Some(Segment { start, end, text: rest.join(" ") })
+            Some(Segment::new(start, end, rest.join(" ")))
         })
         .collect();
     let llm = match montaj_ai::llm::from_keys(&Keys::load(data_dir().as_deref())) {
