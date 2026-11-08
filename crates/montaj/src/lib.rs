@@ -216,7 +216,7 @@ fn fingerprint(audio: &[f32]) -> u64 {
 /// The analysis of `audio`: from the disk cache when this audio was analysed before (free),
 /// else paid (Gemini + the text model) and cached.
 fn analysis_for(audio: &[f32], refresh: bool, progress: &mut dyn FnMut(f32, &str) -> bool) -> std::result::Result<Analysis, String> {
-    let disk = data_dir().map(|d| d.join("montaj").join("analysis").join(format!("{:016x}.json", fingerprint(audio))));
+    let disk = data_dir().map(|d| d.join("montaj").join("analysis").join(format!("v2-{:016x}.json", fingerprint(audio))));
     if !refresh && let Some(a) = disk.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|t| serde_json::from_str::<Analysis>(&t).ok()) {
         // re-plan with the current rules: older analyses get every improvement for free
         let usage = montaj_ai::gemini_stt::Usage { input: a.tokens_in, output: a.tokens_out, thinking: 0 };

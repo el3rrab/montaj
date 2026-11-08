@@ -36,6 +36,8 @@ Rules:\n\
 pub struct GeminiTranscriber {
     key: String,
     model: String,
+    /// Seconds of audio per request in [`GeminiTranscriber::timed`].
+    pub piece_seconds: usize,
 }
 
 /// Token use of one request (Gemini's `usageMetadata`).
@@ -146,7 +148,7 @@ struct ClipAnswer {
 
 impl GeminiTranscriber {
     pub fn new(key: impl Into<String>, model: Option<String>) -> Self {
-        Self { key: key.into(), model: model.filter(|m| !m.is_empty()).unwrap_or_else(|| crate::llm::GEMINI_MODEL.into()) }
+        Self { key: key.into(), model: model.filter(|m| !m.is_empty()).unwrap_or_else(|| crate::llm::GEMINI_MODEL.into()), piece_seconds: TIMED_PIECE_SECONDS }
     }
 
     pub fn from_keys(k: &Keys) -> Option<Self> {
@@ -195,7 +197,8 @@ impl GeminiTranscriber {
     /// nearest edge of real voice (FilmCraft's VAD). Times are seconds from `audio`'s start.
     pub fn timed(&self, audio: &[f32], progress: &mut dyn FnMut(usize, usize) -> bool) -> Result<(Vec<Segment>, Usage), AiError> {
         let sr = SAMPLE_RATE as usize;
-        let pieces = crate::wav::split_points(audio, TIMED_PIECE_SECONDS * sr, 10 * sr, sr / 2);
+        let piece = self.piece_seconds.max(10);
+        let pieces = crate::wav::split_points(audio, piece * sr, (piece / 6).max(3) * sr, sr / 2);
         let mut all = Vec::new();
         let mut total = Usage::default();
         let n = pieces.len();
@@ -272,8 +275,10 @@ impl GeminiTranscriber {
     }
 }
 
-/// Longest piece sent for a timed transcript.
-pub const TIMED_PIECE_SECONDS: usize = 120;
+/// Longest piece sent for a timed transcript. Gemini's timestamps drift on longer audio:
+/// measured on a 31-minute recording, 2-minute pieces left 27% of the voice outside any
+/// sentence (and so cut as "pause"); 1-minute pieces 5%.
+pub const TIMED_PIECE_SECONDS: usize = 60;
 
 /// Requests sent to Gemini at the same time.
 const PARALLEL: usize = 6;
