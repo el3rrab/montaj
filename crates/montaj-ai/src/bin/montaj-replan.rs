@@ -49,6 +49,9 @@ fn main() {
     let old: f64 = a.cuts.iter().map(|c| c.end - c.start).sum();
     let new = montaj_ai::autocut::plan(&audio, a.segments.clone(), a.drops.clone(), montaj_ai::gemini_stt::Usage::default());
     let newcut: f64 = new.cuts.iter().map(|c| c.end - c.start).sum();
+    if let Some(p) = args.get(3) {
+        let _ = std::fs::write(p, serde_json::to_string(&new.keep).unwrap_or_default());
+    }
     let by = |x: &montaj_ai::autocut::Analysis| { let mut m = std::collections::BTreeMap::new(); for c in &x.cuts { let e = m.entry(c.kind.clone()).or_insert((0usize, 0.0f64)); e.0 += 1; e.1 += c.end - c.start; } m };
     println!("saved plan: cut {old:.0} s of {:.0} s  {:?}", a.duration, by(&a));
     println!("new plan:   cut {newcut:.0} s of {:.0} s  {:?}\n", new.duration, by(&new));
