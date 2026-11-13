@@ -4,6 +4,24 @@ Montaj is our own build of [FilmCraft](https://github.com/storytold/filmcraft). 
 FilmCraft's internal names on purpose, so every upstream release merges in cleanly. Everything
 that is ours alone lives in this folder or in files upstream does not have.
 
+## Our layer
+
+Our work sits on top of FilmCraft and never rewrites it, so each FilmCraft release adds to ours
+instead of fighting it:
+
+- **Our code lives only in our own places:** `crates/montaj` (commands, cloud AI hookup),
+  `crates/montaj-ai` (tools), `montaj/` (scripts, docs), `sync.sh` and
+  `.github/workflows/montaj-upstream-sync.yml`.
+- **FilmCraft files get only short hook lines**, each marked with a `// Montaj:` comment:
+  `apps/filmcraft/src/main.rs` and `apps/filmcraft-cli/src/main.rs` (call `montaj::install()`,
+  set the transcriber, no FilmCraft update prompt), their `Cargo.toml` (the `montaj` dependency),
+  and two small extension points in `crates/engine` (`register_extra`, `register_poll`).
+  A new feature goes behind these hooks, never as an edit inside FilmCraft code.
+- **Never change the version in `Cargo.toml`** and don't resolve `Cargo.lock` by hand: both always
+  come from FilmCraft (the sync takes theirs and adds our crates back).
+- To list everything we changed in FilmCraft's files:
+  `git diff $(git describe --tags --abbrev=0 --match 'v*') HEAD -- . ':!montaj' ':!crates/montaj*'`
+
 ## Staying up to date
 
 - **On GitHub:** `.github/workflows/montaj-upstream-sync.yml` checks `storytold/filmcraft` every
