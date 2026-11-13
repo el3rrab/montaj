@@ -276,7 +276,9 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
             }
         }
         let mut app = FilmcraftApp::new(session);
-        app.set_startup_update_check(true);
+        // Montaj: updates come from el3rrab/montaj (montaj/update-local.sh), not the FilmCraft
+        // updater, which offers upstream builds and has no download for our Mac build.
+        app.set_startup_update_check(false);
         app.graphics_notice = notice;
         if recover == Some(false) {
             app.dialog = None;
