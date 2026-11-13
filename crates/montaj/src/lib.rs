@@ -14,6 +14,8 @@
 //! - `montaj.autocut.clearMarks` — **Clear Suggested Cuts**.
 //! - `montaj.autocut.analyze` / `montaj.autocut.apply`: analysis only / apply every suggestion
 //!   (CLI, MCP).
+//! - `montaj.marks.add` — put suggested-cut markers for given time ranges (e.g. the silences LiteRec
+//!   finds on the mic track); Apply Marked Cuts then cuts them like any other suggestion.
 //!
 //! Paid analyses are cached on disk by an audio fingerprint, so the same footage is never paid
 //! for twice. Every applied suggestion is logged (taken / refused) for learning the editor's
@@ -93,6 +95,17 @@ fn specs() -> Vec<CommandSpec> {
             params: r#"{"skip":[int]?}"#,
             enabled: has_analysis,
             run: apply,
+            journal: true,
+            named: NamedKeys::NONE,
+        },
+        CommandSpec {
+            id: "montaj.marks.add",
+            label: "Add Suggested Cuts",
+            menu: &[],
+            shortcut: None,
+            params: r#"{"cuts":[{"start":seconds,"end":seconds,"kind":"silence"|"retake"|…?,"reason":str?}],"replace":bool?}"#,
+            enabled: has_sequence,
+            run: add_marks,
             journal: true,
             named: NamedKeys::NONE,
         },
@@ -361,6 +374,51 @@ fn mark_analysis(s: &mut Session, a: &Analysis) -> Result<usize> {
         q.markers.sort_by_key(|m| m.start);
         Ok(cuts.len())
     })
+}
+
+/// Ids of cuts added from outside (LiteRec's silences) start here, clear of Auto Cut's own ids.
+const OUTSIDE_IDS: usize = 100_000;
+
+/// `montaj.marks.add`: suggested-cut markers for the given ranges (sequence seconds). With `replace`,
+/// earlier suggestion markers go first. Review and apply them like Auto Cut's.
+fn add_marks(s: &mut Session, p: &Value) -> Result<Value> {
+    let cuts: Vec<(f64, f64, String, String)> = p
+        .get("cuts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| err("cuts: a list of {start, end} in seconds"))?
+        .iter()
+        .filter_map(|c| {
+            let (a, b) = (c.get("start")?.as_f64()?, c.get("end")?.as_f64()?);
+            let kind = c.get("kind").and_then(Value::as_str).unwrap_or("silence").to_string();
+            let reason = c.get("reason").and_then(Value::as_str).unwrap_or("").to_string();
+            (b > a && a >= 0.0).then_some((a, b, kind, reason))
+        })
+        .collect();
+    let replace = p.get("replace").and_then(Value::as_bool).unwrap_or(false);
+    let n = cuts.len();
+    s.edit_sequence("Mark Silences", move |q, ctx, _| {
+        if replace {
+            q.markers.retain(|m| !is_mark(m));
+        }
+        for (i, (a, b, kind, reason)) in cuts.iter().enumerate() {
+            let (name, color) = kind_label(kind);
+            q.markers.push(Marker {
+                url: String::new(),
+                author: AUTHOR.into(),
+                custom_color: None,
+                id: MarkerId(ctx.alloc()),
+                start: Tick::from_seconds_f64(*a),
+                duration: Tick::from_seconds_f64(*b) - Tick::from_seconds_f64(*a),
+                name: name.to_string(),
+                comment: format!("[montaj #{}] {reason}", OUTSIDE_IDS + i),
+                kind: MarkerKind::Comment,
+                color,
+            });
+        }
+        q.markers.sort_by_key(|m| m.start);
+        Ok(())
+    })?;
+    Ok(json!({"marked": n}))
 }
 
 fn has_marks(s: &Session) -> std::result::Result<(), String> {
