@@ -44,3 +44,4 @@ else
   log "error: build failed (see above)"
   exit 1
 fi
+"$REPO/montaj/install-app.sh" >> "$LOG" 2>&1 && log "app installed" || log "error: app install failed"
