@@ -110,6 +110,17 @@ fn specs() -> Vec<CommandSpec> {
             named: NamedKeys::NONE,
         },
         CommandSpec {
+            id: "montaj.openLiteRec",
+            label: "Open LiteRec",
+            menu: MENU,
+            shortcut: None,
+            params: "{}",
+            enabled: always,
+            run: open_literec,
+            journal: false,
+            named: NamedKeys::NONE,
+        },
+        CommandSpec {
             id: "montaj.autocut.analyze",
             label: "Auto Cut: Analyze",
             menu: &[],
@@ -148,6 +159,20 @@ fn running() -> &'static Mutex<Option<Running>> {
 
 fn err(msg: impl std::fmt::Display) -> EngineError {
     EngineError::Other(msg.to_string())
+}
+
+fn always(_: &Session) -> std::result::Result<(), String> {
+    Ok(())
+}
+
+/// LiteRec (the recorder that sends videos here): brings it up, or starts it.
+fn open_literec(_: &mut Session, _: &Value) -> Result<Value> {
+    for id in ["com.el3rrab.literec.rs", "com.el3rrab.literec"] {
+        if std::process::Command::new("/usr/bin/open").args(["-b", id]).status().is_ok_and(|s| s.success()) {
+            return Ok(serde_json::json!({"opened": id}));
+        }
+    }
+    Err(EngineError::Other("LiteRec isn't installed".into()))
 }
 
 fn has_sequence(s: &Session) -> std::result::Result<(), String> {
