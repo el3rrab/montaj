@@ -28,6 +28,8 @@ use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+pub mod link;
+
 use filmcraft_engine::commands::NamedKeys;
 use filmcraft_engine::export::{Progress, Report};
 use filmcraft_engine::{CommandSpec, EngineError, Job, Result, Session};

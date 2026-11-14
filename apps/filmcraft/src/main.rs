@@ -103,7 +103,9 @@ fn main() -> eframe::Result {
     // First, so the panic hook and every start-up record are logged (`logging`).
     let logger = logging::install();
     // lossy, so a value that is not Unicode is reported like any other bad port instead of ignored
-    let env_port = std::env::var_os("FILMCRAFT_CONTROL_PORT").map(|p| p.to_string_lossy().into_owned());
+    // Montaj: a window opened without --control still gets a private channel for LiteRec
+    let montaj_link = montaj::link::prepare(&args);
+    let env_port = std::env::var_os("FILMCRAFT_CONTROL_PORT").map(|p| p.to_string_lossy().into_owned()).or(montaj_link.map(|p| p.to_string()));
     let launch = match args::parse(env_port, std::env::args_os().skip(1)) {
         Ok(Cli::Run(l)) => l,
         Ok(Cli::Help) => {
@@ -119,6 +121,8 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
+    // Montaj: where LiteRec finds this window (montaj/link-<pid>.json)
+    montaj::link::publish(launch.control_port);
     let data_root = launch.data_dir.clone().or_else(default_data_dir);
     let log_dir = data_root.as_ref().map(|d| d.join(logging::LOG_DIR));
     log::info!("FilmCraft {} ({} {})", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH);
@@ -170,7 +174,8 @@ fn main() -> eframe::Result {
     // A panic in a FilmCraft started again for it saved the next mode for the next launch.
     let mut next_saved = false;
     let started = loop {
-        let mut options = native_options(launch.control_port.is_some());
+        // Montaj: the LiteRec link is not an agent start; the window opens in front as usual
+        let mut options = native_options(launch.control_port.is_some() && montaj_link.is_none());
         // Before eframe creates the wgpu instance (e.g. no OpenGL on Windows, see graphics.rs).
         graphics::apply(&mut options, graphics.mode(), backend_override);
         let app_created = Arc::new(AtomicBool::new(false));

@@ -65,7 +65,8 @@ impl DisabledWhy {
 /// answer requests (until then they are rejected with a retryable error), and — when the server
 /// is *not* running — why (#3436), for the log and (for a bad token) the status bar.
 pub fn start(port: u16, ctx: egui::Context) -> (Receiver<ControlRequest>, Arc<AtomicBool>, Option<DisabledWhy>) {
-    start_with_token(port, ctx, std::env::var("FILMCRAFT_CONTROL_TOKEN").ok())
+    // Montaj: the private LiteRec token when the environment has none (montaj::link)
+    start_with_token(port, ctx, std::env::var("FILMCRAFT_CONTROL_TOKEN").ok().or_else(montaj::link::token))
 }
 
 fn start_with_token(port: u16, ctx: egui::Context, token: Option<String>) -> (Receiver<ControlRequest>, Arc<AtomicBool>, Option<DisabledWhy>) {
