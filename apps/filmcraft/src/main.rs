@@ -56,9 +56,11 @@ const APP_ID: &str = "ai.storyteller.filmcraft";
 /// `packaging/icons.sh`). macOS gets the tile inside Apple's transparent margin so it matches the
 /// size of other Dock icons; Windows and Linux get the full-bleed tile.
 fn app_icon() -> egui::IconData {
-    #[cfg(target_os = "macos")]
-    let png: &[u8] = include_bytes!("../../../assets/app-icon/filmcraft-macos-512.png");
-    #[cfg(not(target_os = "macos"))]
+    // Montaj: on macOS the Dock shows the bundle's own icon (montaj/icon/Montaj.icon), which follows
+    // the light / dark appearance; an empty icon tells eframe not to replace it.
+    if cfg!(target_os = "macos") {
+        return egui::IconData::default();
+    }
     let png: &[u8] = include_bytes!("../../../assets/app-icon/hicolor/256x256/apps/ai.storyteller.filmcraft.png");
     eframe::icon_data::from_png_bytes(png).unwrap_or_default()
 }

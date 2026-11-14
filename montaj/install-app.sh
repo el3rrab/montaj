@@ -13,7 +13,12 @@ TMP="$(mktemp -d)/Montaj.app"
 mkdir -p "$TMP/Contents/MacOS" "$TMP/Contents/Resources"
 cp "$BIN/filmcraft" "$TMP/Contents/MacOS/FilmCraft"
 cp "$BIN/filmcraft-cli" "$TMP/Contents/MacOS/filmcraft-cli"
-cp "$ROOT/assets/app-icon/filmcraft.icns" "$TMP/Contents/Resources/FilmCraft.icns"
+# Montaj's own icon: white in Light mode, black in Dark mode (Icon Composer .icon → Assets.car);
+# montaj.icns is the fallback for systems that can't read it
+cp "$ROOT/montaj/icon/montaj.icns" "$TMP/Contents/Resources/FilmCraft.icns"
+xcrun actool "$ROOT/montaj/icon/Montaj.icon" --compile "$TMP/Contents/Resources" --platform macosx \
+    --minimum-deployment-target 11.0 --app-icon Montaj --output-partial-info-plist "$TMP/icon.plist" >/dev/null
+rm -f "$TMP/icon.plist"
 cp "$ROOT/NOTICE" "$TMP/Contents/Resources/"
 sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/${VERSION%%-*}/g" \
     -e "s/@BUILD_SHA@/$(git -C "$ROOT" rev-parse --short HEAD)/g" \
@@ -21,6 +26,7 @@ sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/${VERSION%%-*}/g" \
 plutil -replace CFBundleName -string Montaj "$TMP/Contents/Info.plist"
 plutil -replace CFBundleDisplayName -string Montaj "$TMP/Contents/Info.plist" 2>/dev/null || plutil -insert CFBundleDisplayName -string Montaj "$TMP/Contents/Info.plist"
 plutil -replace CFBundleIdentifier -string com.el3rrab.montaj "$TMP/Contents/Info.plist"
+plutil -replace CFBundleIconName -string Montaj "$TMP/Contents/Info.plist"
 printf 'APPL????' > "$TMP/Contents/PkgInfo"
 codesign --force --sign - --timestamp=none "$TMP/Contents/MacOS/filmcraft-cli"
 codesign --force --sign - --timestamp=none --entitlements "$ROOT/packaging/macos/entitlements.plist" "$TMP/Contents/MacOS/FilmCraft"
