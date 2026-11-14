@@ -14,6 +14,8 @@ pub const FILMCRAFT_PANEL: &[Entry] = &[
     // the forward-delete key (Delete on Windows and Linux keyboards) clears timeline clips too;
     // application-wide it is Project ▸ Clear (#243)
     ("edit.clear", "Delete", "Timeline"),
+    // Montaj: Shift+⌫ is Ripple Delete on a Mac keyboard (no forward-delete key), as in Premiere Pro
+    ("edit.rippleDelete", "Shift+Backspace", "Timeline"),
     ("file.newBin", "Cmd+B", "Project"),
     ("edit.undo", "Left", "History"),
     ("edit.redo", "Right", "History"),

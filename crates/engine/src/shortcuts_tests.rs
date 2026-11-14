@@ -427,3 +427,11 @@ fn presets_named_active_get_their_own_files() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn shift_backspace_ripple_deletes_in_the_timeline_by_default() {
+    // a Mac keyboard has no forward-delete key: Shift+Delete can't be typed, Shift+⌫ can
+    let mut s = Session::default();
+    with_ui_commands(&mut s);
+    assert!(s.shortcuts.for_command("edit.rippleDelete").iter().any(|b| b.panel.as_deref() == Some("Timeline") && b.keys == "Shift+Backspace"));
+}
