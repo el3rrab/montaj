@@ -18,7 +18,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # HTTPS with pure-Rust TLS and the OS certificate verifier, as filmcraft-speech's downloader.
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
-rustls-rustcrypto = "0.0.2-alpha"
+rustls-rustcrypto = "0.1.0-pre.0"
 
 [dev-dependencies]
 tempfile = "3.27"
